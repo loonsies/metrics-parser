@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local environment
+.env
+.env.*
+
+# Output artifacts
+/output/
+
+# OS junk
+.DS_Store
+Thumbs.db
