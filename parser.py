@@ -41,9 +41,105 @@ class FFXIBattleAnalyzer:
         
         # Detect boss (from Mob Death or mob actions)
         self.boss = self._detect_boss()
-        
+
+        # Remove boss from players list if present (boss rows sometimes appear in 'Player Name')
+        try:
+            if self.boss in self.players:
+                self.players.remove(self.boss)
+        except Exception:
+            pass
+
+        # Extract player job/subjob information (if available)
+        self.player_jobs = self._extract_player_jobs()
+
         # Assign consistent colors to each player
         self.player_colors = self._assign_player_colors()
+
+    def _extract_player_jobs(self):
+        """Try to extract job/subjob for each player from available CSVs.
+
+        Heuristics:
+        - Look for explicit 'Job' or 'SubJob' columns in `basic`, `catalog`, or `battle_log`.
+        - Search `battle_log` text fields (Note, Action) for known job abbreviations.
+        Returns mapping: player_name -> "JOB[/SUB]" or empty string.
+        """
+        jobs = {}
+        # initialize empty
+        for p in self.players:
+            jobs[p] = ''
+
+        dfs = [self.basic, self.catalog, self.battle_log]
+        name_cols = ['Player Name', 'Actor', 'Name']
+        # Try explicit columns first
+        for df in dfs:
+            if df is None:
+                continue
+            cols = set(df.columns)
+            # find a name column present in this df
+            name_col = None
+            for nc in name_cols:
+                if nc in cols:
+                    name_col = nc
+                    break
+            if not name_col:
+                continue
+
+            # explicit Job/SubJob columns
+            if 'Job' in cols or 'SubJob' in cols:
+                for _, row in df.iterrows():
+                    try:
+                        name = row.get(name_col, '')
+                        if not name or pd.isna(name):
+                            continue
+                        name = str(name)
+                        job = ''
+                        if 'Job' in cols and not pd.isna(row.get('Job', '')):
+                            job = str(row.get('Job', '')).strip()
+                        sub = ''
+                        if 'SubJob' in cols and not pd.isna(row.get('SubJob', '')):
+                            sub = str(row.get('SubJob', '')).strip()
+                        if job and sub:
+                            jobs.setdefault(name, f"{job}/{sub}")
+                        elif job:
+                            jobs.setdefault(name, job)
+                    except Exception:
+                        continue
+
+        # If still missing, search free text for job abbreviations
+        known_jobs = ['WAR','PLD','DRK','MNK','SAM','NIN','DRG','BRD','RNG','COR','PUP','BLM','RDM','SMN','WHM','SCH','BLU','GEO','DNC','BST','PUP','THF']
+        # normalize to uppercase when searching
+        if self.battle_log is not None:
+            for _, row in self.battle_log.iterrows():
+                try:
+                    pname = row.get('Player Name', '')
+                    if not pname or pd.isna(pname):
+                        continue
+                    pname = str(pname)
+                    # only try to fill if not already known
+                    if jobs.get(pname):
+                        continue
+                    text_fields = []
+                    for k in ('Note','Action'):
+                        if k in row.index and not pd.isna(row.get(k, '')):
+                            text_fields.append(str(row.get(k, '')))
+                    combined = ' '.join(text_fields).upper()
+                    for kj in known_jobs:
+                        if kj in combined:
+                            jobs[pname] = kj
+                            break
+                except Exception:
+                    continue
+
+        return jobs
+
+    def get_player_label(self, name):
+        """Return a display label for a player including job/subjob if available."""
+        if not name:
+            return ''
+        job = self.player_jobs.get(name, '') if hasattr(self, 'player_jobs') else ''
+        if job:
+            return f"{name} ({job})"
+        return name
     
     def _assign_player_colors(self):
         """Assign a unique consistent color to each player"""
@@ -593,9 +689,15 @@ def _prepare_bg_data_uri(path, w, h, blur_radius=4, darken_alpha=0.28):
         return None
 
 
-def create_base(title, subtitle, analyzer):
-    """Common base: background, title"""
-    dwg = svgwrite.Drawing(size=(f'{W}px', f'{H}px'))
+def create_base(title, subtitle, analyzer, width=None, height=None):
+    """Common base: background, title.
+
+    width/height default to global W/H but can be overridden to create taller images.
+    """
+    local_w = int(width) if width is not None else W
+    local_h = int(height) if height is not None else H
+
+    dwg = svgwrite.Drawing(size=(f'{local_w}px', f'{local_h}px'))
     try:
         dwg.attribs['font-family'] = FONT_FAMILY
     except Exception:
@@ -605,39 +707,44 @@ def create_base(title, subtitle, analyzer):
 
     # background image if available -> embed as data URI after processing to cover area
     if analyzer.background_image and Path(analyzer.background_image).exists():
-        bg_data = _prepare_bg_data_uri(analyzer.background_image, W, H, blur_radius=IMG_BLUR_RADIUS, darken_alpha=IMG_DARKEN_ALPHA)
+        bg_data = _prepare_bg_data_uri(analyzer.background_image, local_w, local_h, blur_radius=IMG_BLUR_RADIUS, darken_alpha=IMG_DARKEN_ALPHA)
         if bg_data:
-            dwg.add(dwg.image(href=bg_data, insert=(0, 0), size=(W, H)))
+            dwg.add(dwg.image(href=bg_data, insert=(0, 0), size=(local_w, local_h)))
     # overlay (subtle) - color/opac configurable via .env
-    dwg.add(dwg.rect(insert=(0, 0), size=(W, H), fill=BG_OVERLAY_COLOR, fill_opacity=BG_OVERLAY_OPACITY))
+    dwg.add(dwg.rect(insert=(0, 0), size=(local_w, local_h), fill=BG_OVERLAY_COLOR, fill_opacity=BG_OVERLAY_OPACITY))
     # title
-    dwg.add(dwg.text(title, insert=(W / 2, 26), text_anchor='middle', fill=TITLE_COLOR, font_size=16, font_weight='bold'))
-    dwg.add(dwg.text(subtitle, insert=(W / 2, 44), text_anchor='middle', fill=SUBTITLE_COLOR, font_size=11))
+    dwg.add(dwg.text(title, insert=(local_w / 2, 26), text_anchor='middle', fill=TITLE_COLOR, font_size=16, font_weight='bold'))
+    dwg.add(dwg.text(subtitle, insert=(local_w / 2, 44), text_anchor='middle', fill=SUBTITLE_COLOR, font_size=11))
     return dwg
 
 
-def save_svg_and_png(dwg, name_base):
-    """Save PNG only (skip SVG) and render via Playwright"""
+def save_svg_and_png(dwg, name_base, width=None, height=None):
+    """Save PNG only (skip SVG) and render via Playwright.
+
+    width/height default to globals if not provided.
+    """
     png_path = OUTPUT_DIR / f"{name_base}.png"
     svg_bytes = dwg.tostring().encode('utf-8')
-    
+
     # Render via Playwright sync (no SVG file saved)
     try:
         from playwright.sync_api import sync_playwright
     except Exception as e:
         print(f'Playwright not available: {e}')
         return None
-    
+
     # Use temp SVG in memory
     import tempfile
     with tempfile.NamedTemporaryFile(mode='w', suffix='.svg', delete=False, encoding='utf-8') as tmp:
         tmp.write(dwg.tostring())
         tmp_path = Path(tmp.name)
-    
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch()
-            context = browser.new_context(viewport={'width':W,'height':H}, device_scale_factor=1)
+            vw = int(width) if width is not None else W
+            vh = int(height) if height is not None else H
+            context = browser.new_context(viewport={'width': vw, 'height': vh}, device_scale_factor=1)
             page = context.new_page()
             page.goto(tmp_path.resolve().as_uri())
             page.wait_for_timeout(200)
@@ -695,7 +802,8 @@ def build_dps(analyzer):
             tot = dps_stats[p]['total_damage']
             bw = int((dps / max_dps) * bar_total_w) if max_dps>0 else 0
             name_x = block_start_x + name_w - 4
-            dwg.add(dwg.text(p, insert=(name_x, cy + bar_h/2), fill=color, font_size=12, font_weight='bold', text_anchor='end', **{'dominant-baseline':'middle'}))
+            label = analyzer.get_player_label(p)
+            dwg.add(dwg.text(label, insert=(name_x, cy + bar_h/2), fill=color, font_size=12, font_weight='bold', text_anchor='end', **{'dominant-baseline':'middle'}))
             bar_x = block_start_x + name_w + gap_between
             dwg.add(dwg.rect(insert=(bar_x, cy), size=(bar_total_w, bar_h-2), fill=PANEL_BG_COLOR, rx=2, ry=2))
             dwg.add(dwg.rect(insert=(bar_x, cy), size=(bw, bar_h-2), fill=color, rx=2, ry=2))
@@ -747,7 +855,8 @@ def build_dps(analyzer):
         swatch_y = baseline_y - 6
         text_x = cell_center_x - 6
         dwg.add(dwg.rect(insert=(swatch_x, swatch_y), size=(12,12), fill=color))
-        dwg.add(dwg.text(p, insert=(text_x, baseline_y), fill=color, font_size=11, **{'dominant-baseline':'middle'}))
+    player_label = analyzer.get_player_label(p)
+    dwg.add(dwg.text(player_label, insert=(text_x, baseline_y), fill=color, font_size=11, **{'dominant-baseline':'middle'}))
         lx += cell_w
         col_count += 1
         if col_count >= legend_cols:
@@ -793,7 +902,8 @@ def build_healing(analyzer):
             cnt = healers[p]['heal_count']
             bw = int((val/max_h)*bar_total_w) if max_h>0 else 0
             name_x = block_start_x + name_w - 4
-            dwg.add(dwg.text(p, insert=(name_x, cy + bar_h/2), fill=color, font_size=name_font_size, font_weight='bold', text_anchor='end', **{'dominant-baseline':'middle'}))
+            label = analyzer.get_player_label(p)
+            dwg.add(dwg.text(label, insert=(name_x, cy + bar_h/2), fill=color, font_size=name_font_size, font_weight='bold', text_anchor='end', **{'dominant-baseline':'middle'}))
             bar_x = block_start_x + name_w + gap_between
             dwg.add(dwg.rect(insert=(bar_x, cy), size=(bar_total_w, bar_h-3), fill=PANEL_BG_COLOR, rx=2, ry=2))
             dwg.add(dwg.rect(insert=(bar_x, cy), size=(bw, bar_h-3), fill=color, rx=2, ry=2))
@@ -830,7 +940,8 @@ def build_healing(analyzer):
             cnt_r = recipients[p]['heal_count']
             bw_r = int((val_r/max_r)*bar_total_w_r) if max_r>0 else 0
             name_x_r = block_start_x_r + name_w_r - 4
-            dwg.add(dwg.text(p, insert=(name_x_r, cy_r + bar_h_r/2), fill=color, font_size=name_font_r, font_weight='bold', text_anchor='end', **{'dominant-baseline':'middle'}))
+            label_r = analyzer.get_player_label(p)
+            dwg.add(dwg.text(label_r, insert=(name_x_r, cy_r + bar_h_r/2), fill=color, font_size=name_font_r, font_weight='bold', text_anchor='end', **{'dominant-baseline':'middle'}))
             bar_x_r = block_start_x_r + name_w_r + gap_between_r
             dwg.add(dwg.rect(insert=(bar_x_r, cy_r), size=(bar_total_w_r, bar_h_r-3), fill=PANEL_BG_COLOR, rx=2, ry=2))
             dwg.add(dwg.rect(insert=(bar_x_r, cy_r), size=(bw_r, bar_h_r-3), fill=color, rx=2, ry=2))
@@ -872,7 +983,8 @@ def build_damage_taken(analyzer):
             deaths = dmg[p]['deaths']
             bw = int((val/maxd)*bar_total_w) if maxd>0 else 0
             name_x = block_start_x + name_w - 4
-            dwg.add(dwg.text(p, insert=(name_x, cy + bar_h/2), fill=color, font_size=13, font_weight='bold', text_anchor='end', **{'dominant-baseline':'middle'}))
+            label = analyzer.get_player_label(p)
+            dwg.add(dwg.text(label, insert=(name_x, cy + bar_h/2), fill=color, font_size=13, font_weight='bold', text_anchor='end', **{'dominant-baseline':'middle'}))
             bar_x = block_start_x + name_w + gap_between
             dwg.add(dwg.rect(insert=(bar_x, cy), size=(bar_total_w, bar_h-3), fill=PANEL_BG_COLOR, rx=2, ry=2))
             dwg.add(dwg.rect(insert=(bar_x, cy), size=(bw, bar_h-3), fill=color, rx=2, ry=2))
@@ -923,7 +1035,8 @@ def build_overall(analyzer):
     for row_idx, p in enumerate(players):
         col_x = x
         ry = y + header_h + (row_idx + 0.5) * row_h
-        vals = [p, f"{dps[p]['total_damage']:,.0f}", f"{dps[p]['dps']:.1f}", f"{healing[p]['total_healing']:,.0f}", f"{dmg[p]['total_damage_taken']:,.0f}", f"{dmg[p]['deaths']}"]
+        player_label = analyzer.get_player_label(p)
+        vals = [player_label, f"{dps[p]['total_damage']:,.0f}", f"{dps[p]['dps']:.1f}", f"{healing[p]['total_healing']:,.0f}", f"{dmg[p]['total_damage_taken']:,.0f}", f"{dmg[p]['deaths']}"]
         for i,v in enumerate(vals):
             color = analyzer.player_colors.get(p) if i==0 else TEXT_PRIMARY
             dwg.add(dwg.text(str(v), insert=(col_x+8, ry), fill=color, font_size=11, font_weight='bold' if i==0 else 'normal', **{'dominant-baseline':'middle'}))
@@ -968,7 +1081,8 @@ def build_weaponskill(analyzer):
     for row_idx, item in enumerate(ws[:10]):
         col_x = x
         ry = y + header_h + (row_idx + 0.5) * row_h
-        vals = [item['Player'], item['Weaponskill'], item['Count'], f"{item['Min']:,.0f}", f"{item['Max']:,.0f}", f"{item['Avg']:,.0f}", f"{item['Total']:,.0f}"]
+        player_label = analyzer.get_player_label(item['Player'])
+        vals = [player_label, item['Weaponskill'], item['Count'], f"{item['Min']:,.0f}", f"{item['Max']:,.0f}", f"{item['Avg']:,.0f}", f"{item['Total']:,.0f}"]
         for i,v in enumerate(vals):
             color = analyzer.player_colors.get(item['Player']) if i==0 else TEXT_PRIMARY
             dwg.add(dwg.text(str(v), insert=(col_x+8, ry), fill=color, font_size=11, **{'dominant-baseline':'middle'}))
@@ -979,10 +1093,6 @@ def build_weaponskill(analyzer):
 def build_key_moments(analyzer):
     """Key moments: deaths, victory, fight start, milestones"""
     km = analyzer.get_key_moments()
-    dwg = create_base(f"Key Moments - {analyzer.boss}", 'Duration: ' + analyzer.get_fight_duration()[0], analyzer)
-    x,y,wid,hei = 12,56,726,228
-    dwg.add(dwg.rect(insert=(x,y), size=(wid,hei), rx=6, ry=6, fill='none', stroke='none'))
-    ry = y + 12
 
     # Convert milestones and fight start into key-moment entries so they render the same way
     milestones = analyzer.calculate_boss_hp_milestones()
@@ -997,7 +1107,7 @@ def build_key_moments(analyzer):
                 'type': 'Fight Start',
                 'color': FIGHT_START_COLOR
             })
-        for key,label_color in [('75%','#cccccc'), ('50%','#cccccc'), ('25%','#cccccc')]:
+        for key in ('75%', '50%', '25%'):
             if key in milestones:
                 additional.append({
                     'time': milestones[key],
@@ -1010,7 +1120,31 @@ def build_key_moments(analyzer):
     combined = list(km) + additional
     combined.sort(key=lambda x: x.get('time',''), reverse=True)
 
-    for m in combined[:10]:
+    # Determine required canvas height based on number of entries and their details
+    content_start_y = 56
+    ry_sim = content_start_y + 12
+    per_entry_heights = []
+    for m in combined:
+        entry_h = 16  # title line
+        details = m.get('action', '')
+        if details:
+            detail_parts = [part.strip() for part in details.split(';') if part.strip()]
+            entry_h += len(detail_parts) * 14
+        entry_h += 6  # spacing after entry
+        per_entry_heights.append(entry_h)
+
+    total_entries_height = sum(per_entry_heights)
+    needed_h = content_start_y + 12 + total_entries_height + 16  # bottom margin
+    canvas_h = max(H, int(needed_h))
+
+    # Create a base drawing with computed height
+    dwg = create_base(f"Key Moments - {analyzer.boss}", 'Duration: ' + analyzer.get_fight_duration()[0], analyzer, width=W, height=canvas_h)
+    x,y,wid,hei = 12,56,W-24, canvas_h - 56 - 16
+    dwg.add(dwg.rect(insert=(x,y), size=(wid,hei), rx=6, ry=6, fill='none', stroke='none'))
+    ry = y + 12
+
+    # Render all entries
+    for m in combined:
         player = m.get('player', '')
         color = m.get('color') if m.get('color') else (analyzer.player_colors.get(player, TEXT_PRIMARY) if player else TEXT_SECONDARY)
         if player:
@@ -1022,13 +1156,14 @@ def build_key_moments(analyzer):
         dwg.add(dwg.text(title_txt, insert=(x+12, ry), fill=color, font_size=12, font_weight='bold', **{'dominant-baseline':'middle'}))
         ry += 16
         if details:
-            detail_parts = [part.strip() for part in details.split(';')]
+            detail_parts = [part.strip() for part in details.split(';') if part.strip()]
             for detail in detail_parts:
                 if detail:
                     dwg.add(dwg.text(detail, insert=(x+20, ry), fill=TEXT_SECONDARY, font_size=10, **{'dominant-baseline':'middle'}))
                     ry += 14
         ry += 6
-    return save_svg_and_png(dwg, 'key_moments')
+
+    return save_svg_and_png(dwg, 'key_moments', width=W, height=canvas_h)
 
 
 # ============================================================================
