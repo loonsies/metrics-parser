@@ -13,6 +13,7 @@ from pathlib import Path
 from collections import defaultdict
 import math
 import svgwrite
+import re
 import base64
 import io
 import requests
@@ -63,14 +64,23 @@ class FFXIBattleAnalyzer:
         - Search `battle_log` text fields (Note, Action) for known job abbreviations.
         Returns mapping: player_name -> "JOB[/SUB]" or empty string.
         """
-        jobs = {}
-        # initialize empty
-        for p in self.players:
-            jobs[p] = ''
+        # Build a normalized lookup (lowercased, stripped) so we can match names across CSVs
+        def norm(n):
+            try:
+                return str(n).strip().lower()
+            except Exception:
+                return ''
+
+        # initialize temp mapping for all known players
+        temp = {norm(p): '' for p in self.players}
 
         dfs = [self.basic, self.catalog, self.battle_log]
         name_cols = ['Player Name', 'Actor', 'Name']
-        # Try explicit columns first
+        # column name alternatives for Job/SubJob
+        job_cols = ['Job', 'JOB']
+        subjob_cols = ['SubJob', 'Sub Job', 'Subjob', 'Sub-Job', 'SUBJOB']
+
+        # First, try explicit Job/SubJob columns in any dataframe
         for df in dfs:
             if df is None:
                 continue
@@ -84,62 +94,91 @@ class FFXIBattleAnalyzer:
             if not name_col:
                 continue
 
-            # explicit Job/SubJob columns
-            if 'Job' in cols or 'SubJob' in cols:
+            # try to detect job/subjob columns flexibly
+            found_job_col = next((c for c in cols if c.lower() == 'job'), None)
+            found_sub_col = next((c for c in cols if c.replace(' ', '').lower() in {s.replace(' ', '').lower() for s in subjob_cols}), None)
+
+            if found_job_col:
                 for _, row in df.iterrows():
                     try:
                         name = row.get(name_col, '')
-                        if not name or pd.isna(name):
+                        if pd.isna(name) or not name:
                             continue
-                        name = str(name)
+                        n = norm(name)
                         job = ''
-                        if 'Job' in cols and not pd.isna(row.get('Job', '')):
-                            job = str(row.get('Job', '')).strip()
                         sub = ''
-                        if 'SubJob' in cols and not pd.isna(row.get('SubJob', '')):
-                            sub = str(row.get('SubJob', '')).strip()
+                        if not pd.isna(row.get(found_job_col, '')):
+                            job = str(row.get(found_job_col, '')).strip()
+                        if found_sub_col and not pd.isna(row.get(found_sub_col, '')):
+                            sub = str(row.get(found_sub_col, '')).strip()
                         if job and sub:
-                            jobs.setdefault(name, f"{job}/{sub}")
+                            if not temp.get(n):
+                                temp[n] = f"{job}/{sub}"
                         elif job:
-                            jobs.setdefault(name, job)
+                            if not temp.get(n):
+                                temp[n] = job
                     except Exception:
                         continue
 
-        # If still missing, search free text for job abbreviations
-        known_jobs = ['WAR','PLD','DRK','MNK','SAM','NIN','DRG','BRD','RNG','COR','PUP','BLM','RDM','SMN','WHM','SCH','BLU','GEO','DNC','BST','PUP','THF']
-        # normalize to uppercase when searching
+        # If still missing, search free text for job and subjob abbreviations in battle_log text
+        # Use word-boundary-aware patterns and explicit JOB/SUB patterns so we do not match
+        # substrings inside ability names (e.g. 'WARCRY' -> should NOT match 'WAR').
+        known_jobs = ['WAR','PLD','DRK','MNK','SAM','NIN','DRG','BRD','RNG','COR','PUP','BLM','RDM','SMN','WHM','SCH','BLU','GEO','DNC','BST','THF']
+        # patterns: explicit JOB/SUB or JOB (SUB), or standalone JOB token (with word boundaries)
+        job_alts = '|'.join(known_jobs)
+        job_sub_pattern = re.compile(rf"\b({job_alts})\s*(?:/|\(|-)\s*([A-Z]{{2,4}})\b")
+        single_job_pattern = re.compile(rf"\b({job_alts})\b")
+
         if self.battle_log is not None:
             for _, row in self.battle_log.iterrows():
                 try:
                     pname = row.get('Player Name', '')
-                    if not pname or pd.isna(pname):
+                    if pd.isna(pname) or not pname:
                         continue
-                    pname = str(pname)
-                    # only try to fill if not already known
-                    if jobs.get(pname):
+                    n = norm(pname)
+                    if temp.get(n):
                         continue
                     text_fields = []
                     for k in ('Note','Action'):
                         if k in row.index and not pd.isna(row.get(k, '')):
                             text_fields.append(str(row.get(k, '')))
                     combined = ' '.join(text_fields).upper()
-                    for kj in known_jobs:
-                        if kj in combined:
-                            jobs[pname] = kj
-                            break
+
+                    # First, try explicit JOB/SUB patterns like "WAR/SAM" or "WAR (SAM)"
+                    m = job_sub_pattern.search(combined)
+                    if m:
+                        job = m.group(1)
+                        sub = m.group(2) or ''
+                        temp[n] = f"{job}/{sub}".rstrip('/')
+                        continue
+
+                    # Next, look for a standalone job token with word boundaries.
+                    # This avoids matching substrings inside ability names (e.g. WARCRY).
+                    m2 = single_job_pattern.search(combined)
+                    if m2:
+                        temp[n] = m2.group(1)
                 except Exception:
                     continue
+
+        # Map back to original player names (preserve original casing/whitespace)
+        jobs = {}
+        for p in self.players:
+            jobs[p] = temp.get(norm(p), '')
 
         return jobs
 
     def get_player_label(self, name):
         """Return a display label for a player including job/subjob if available."""
+        # Return the player name (no job) — job is displayed separately by renderers
         if not name:
             return ''
-        job = self.player_jobs.get(name, '') if hasattr(self, 'player_jobs') else ''
-        if job:
-            return f"{name} ({job})"
-        return name
+        return str(name)
+
+    def get_player_job(self, name):
+        """Return the player's job/subjob string (e.g. 'WAR/SAM') or empty string."""
+        if not name:
+            return ''
+        return self.player_jobs.get(name, '') if hasattr(self, 'player_jobs') else ''
     
     def _assign_player_colors(self):
         """Assign a unique consistent color to each player"""
@@ -773,7 +812,22 @@ def upload_to_discord(png_path, webhook_url):
         return False
 
 
-def build_dps(analyzer):
+def send_discord_message(content, webhook_url):
+    """Send a simple text message to Discord via webhook."""
+    try:
+        response = requests.post(webhook_url, json={'content': content})
+        if response.status_code in (200, 204):
+            print('  → Sent Discord message')
+            return True
+        else:
+            print(f'  → Discord message failed: {response.status_code} - {response.text}')
+            return False
+    except Exception as e:
+        print(f'  → Error sending Discord message: {e}')
+        return False
+
+
+def build_dps(analyzer, suffix=''):
     """DPS: bars + pie"""
     dps_stats = analyzer.calculate_dps_stats()
     players = [p for p,s in dps_stats.items() if s['total_damage']>0]
@@ -802,8 +856,14 @@ def build_dps(analyzer):
             tot = dps_stats[p]['total_damage']
             bw = int((dps / max_dps) * bar_total_w) if max_dps>0 else 0
             name_x = block_start_x + name_w - 4
-            label = analyzer.get_player_label(p)
-            dwg.add(dwg.text(label, insert=(name_x, cy + bar_h/2), fill=color, font_size=12, font_weight='bold', text_anchor='end', **{'dominant-baseline':'middle'}))
+            name_text = analyzer.get_player_label(p)
+            job_text = analyzer.get_player_job(p)
+            # Draw name (primary) and job (smaller, secondary) stacked within the bar name area
+            name_y = cy + (bar_h / 2) - 4
+            job_y = cy + (bar_h / 2) + 6
+            dwg.add(dwg.text(name_text, insert=(name_x, name_y), fill=color, font_size=12, font_weight='bold', text_anchor='end', **{'dominant-baseline':'middle'}))
+            if job_text:
+                dwg.add(dwg.text(job_text, insert=(name_x, job_y), fill=TEXT_SECONDARY, font_size=9, text_anchor='end', **{'dominant-baseline':'middle'}))
             bar_x = block_start_x + name_w + gap_between
             dwg.add(dwg.rect(insert=(bar_x, cy), size=(bar_total_w, bar_h-2), fill=PANEL_BG_COLOR, rx=2, ry=2))
             dwg.add(dwg.rect(insert=(bar_x, cy), size=(bw, bar_h-2), fill=color, rx=2, ry=2))
@@ -855,18 +915,18 @@ def build_dps(analyzer):
         swatch_y = baseline_y - 6
         text_x = cell_center_x - 6
         dwg.add(dwg.rect(insert=(swatch_x, swatch_y), size=(12,12), fill=color))
-    player_label = analyzer.get_player_label(p)
-    dwg.add(dwg.text(player_label, insert=(text_x, baseline_y), fill=color, font_size=11, **{'dominant-baseline':'middle'}))
+        player_label = analyzer.get_player_label(p)
+        dwg.add(dwg.text(player_label, insert=(text_x, baseline_y), fill=color, font_size=11, **{'dominant-baseline':'middle'}))
         lx += cell_w
         col_count += 1
         if col_count >= legend_cols:
             col_count = 0
             lx = lx_start
             baseline_y += 18
-    return save_svg_and_png(dwg, 'dps_summary')
+    return save_svg_and_png(dwg, f'dps_summary{suffix}')
 
 
-def build_healing(analyzer):
+def build_healing(analyzer, suffix=''):
     """Healing: split left (healers) and right (recipients)"""
     healing = analyzer.calculate_healing_stats()
     healing_received = analyzer.calculate_healing_received_stats()
@@ -952,10 +1012,10 @@ def build_healing(analyzer):
     
     dwg.add(dwg.text('Heal Given', insert=(left_x + left_w/2, left_y + 16), text_anchor='middle', fill=TEXT_PRIMARY, font_size=12, font_weight='bold'))
     dwg.add(dwg.text('Heal Received', insert=(right_x + right_w/2, right_y + 16), text_anchor='middle', fill=TEXT_PRIMARY, font_size=12, font_weight='bold'))
-    return save_svg_and_png(dwg, 'healing_summary')
+    return save_svg_and_png(dwg, f'healing_summary{suffix}')
 
 
-def build_damage_taken(analyzer):
+def build_damage_taken(analyzer, suffix=''):
     """Damage taken"""
     dmg = analyzer.calculate_damage_taken()
     players = sorted([p for p in dmg.keys() if dmg[p]['total_damage_taken']>0], key=lambda p: dmg[p]['total_damage_taken'], reverse=True)
@@ -992,10 +1052,10 @@ def build_damage_taken(analyzer):
             lx_dt = bar_x + bar_total_w - 6
             dwg.add(dwg.text(label_text_dt, insert=(lx_dt, cy + bar_h/2), text_anchor='end', fill=TEXT_PRIMARY, font_size=12, **{'dominant-baseline':'middle'}))
             cy += bar_h + gap
-    return save_svg_and_png(dwg, 'damage_taken')
+    return save_svg_and_png(dwg, f'damage_taken{suffix}')
 
 
-def build_overall(analyzer):
+def build_overall(analyzer, suffix=''):
     """Overall stats table"""
     dps = analyzer.calculate_dps_stats()
     healing = analyzer.calculate_healing_stats()
@@ -1041,10 +1101,10 @@ def build_overall(analyzer):
             color = analyzer.player_colors.get(p) if i==0 else TEXT_PRIMARY
             dwg.add(dwg.text(str(v), insert=(col_x+8, ry), fill=color, font_size=11, font_weight='bold' if i==0 else 'normal', **{'dominant-baseline':'middle'}))
             col_x += scaled[i]
-    return save_svg_and_png(dwg, 'overall_stats')
+    return save_svg_and_png(dwg, f'overall_stats{suffix}')
 
 
-def build_weaponskill(analyzer):
+def build_weaponskill(analyzer, suffix=''):
     """Weaponskill details"""
     ws = analyzer.calculate_weaponskill_stats()
     dwg = create_base(f"Weaponskill Details - {analyzer.boss}", 'Duration: ' + analyzer.get_fight_duration()[0], analyzer)
@@ -1087,10 +1147,10 @@ def build_weaponskill(analyzer):
             color = analyzer.player_colors.get(item['Player']) if i==0 else TEXT_PRIMARY
             dwg.add(dwg.text(str(v), insert=(col_x+8, ry), fill=color, font_size=11, **{'dominant-baseline':'middle'}))
             col_x += scaled[i]
-    return save_svg_and_png(dwg, 'weaponskill_details')
+    return save_svg_and_png(dwg, f'weaponskill_details{suffix}')
 
 
-def build_key_moments(analyzer):
+def build_key_moments(analyzer, suffix=''):
     """Key moments: deaths, victory, fight start, milestones"""
     km = analyzer.get_key_moments()
 
@@ -1163,7 +1223,7 @@ def build_key_moments(analyzer):
                     ry += 14
         ry += 6
 
-    return save_svg_and_png(dwg, 'key_moments', width=W, height=canvas_h)
+    return save_svg_and_png(dwg, f'key_moments{suffix}', width=W, height=canvas_h)
 
 
 # ============================================================================
@@ -1172,81 +1232,98 @@ def build_key_moments(analyzer):
 
 def main():
     """Main function to run the battle analyzer"""
-    
-    # Find battle log, basic, and catalog files from INPUT folder
-    battle_log_files = list(INPUT_DIR.glob('*Battle Log*.csv'))
-    basic_files = list(INPUT_DIR.glob('*Basic*.csv'))
-    catalog_files = list(INPUT_DIR.glob('*Catalog*.csv'))
-    background_files = list(INPUT_DIR.glob('background.png'))
-    
-    if not battle_log_files or not basic_files:
-        print("ERROR: Could not find required CSV files in 'input/' folder!")
-        print("Please ensure the 'input/' folder contains:")
-        print("  - A file containing 'Battle Log' in the name")
-        print("  - A file containing 'Basic' in the name")
+    # Find all input files and group them by timestamp prefix in filename (e.g. "MM-DD-YYYY HH-MM-SS")
+    all_files = [p for p in INPUT_DIR.iterdir() if p.is_file()]
+    groups = defaultdict(list)
+    ts_re = re.compile(r'^(\d{1,2}-\d{1,2}-\d{4} \d{2}-\d{2}-\d{2})')
+    for p in all_files:
+        m = ts_re.match(p.name)
+        if m:
+            key = m.group(1)
+        else:
+            # fallback to file modification timestamp
+            key = datetime.fromtimestamp(p.stat().st_mtime).strftime('%m-%d-%Y %H-%M-%S')
+        groups[key].append(p)
+
+    # Build list of groups that contain at least a Battle Log and Basic CSV
+    valid_groups = []
+    for key, files in groups.items():
+        names = [f.name for f in files]
+        has_battle = any('Battle Log' in n for n in names)
+        has_basic = any('Basic' in n for n in names)
+        if has_battle and has_basic:
+            valid_groups.append((key, files))
+
+    if not valid_groups:
+        print("ERROR: Could not find required CSV file sets in 'input/' folder!")
+        print("Please ensure the 'input/' folder contains matching 'Battle Log' and 'Basic' CSVs (grouped by timestamp prefix).")
         return
-    
-    # Select most recent files by modification time
-    battle_log_file = max(battle_log_files, key=lambda p: p.stat().st_mtime)
-    basic_file = max(basic_files, key=lambda p: p.stat().st_mtime)
-    catalog_file = max(catalog_files, key=lambda p: p.stat().st_mtime) if catalog_files else None
-    background_file = background_files[0] if background_files else None
-    
-    print(f"Found Battle Log: {battle_log_file.name}")
-    print(f"Found Basic CSV: {basic_file.name}")
-    if catalog_file:
-        print(f"Found Catalog: {catalog_file.name}")
-    if background_file:
-        print(f"Found Background: {background_file.name}")
-    
-    # Initialize analyzer
-    analyzer = FFXIBattleAnalyzer(
-        battle_log_file,
-        basic_file,
-        catalog_file,
-        background_file
-    )
-    
-    print(f"\nBoss detected: {analyzer.boss}")
-    print(f"Players: {', '.join(analyzer.players)}")
-    print(f"Fight duration: {analyzer.get_fight_duration()[0]}")
-    
-    # Generate all images and collect paths
-    print("\nGenerating battle summary images...")
+
+    # Sort groups from older to newer by parsing the timestamp key
+    def _parse_group_key(k):
+        try:
+            return datetime.strptime(k, '%m-%d-%Y %H-%M-%S')
+        except Exception:
+            # fallback: use epoch of newest file in group
+            files = groups.get(k, [])
+            if not files:
+                return datetime.fromtimestamp(0)
+            return datetime.fromtimestamp(max(f.stat().st_mtime for f in files))
+
+    valid_groups.sort(key=lambda t: _parse_group_key(t[0]))
+
+    # Process each group in order
+    print(f"Processing {len(valid_groups)} input groups (oldest → newest)")
     generated_files = []
-    
-    png_path = build_dps(analyzer)
-    if png_path:
-        generated_files.append(png_path)
-    
-    png_path = build_healing(analyzer)
-    if png_path:
-        generated_files.append(png_path)
-    
-    png_path = build_damage_taken(analyzer)
-    if png_path:
-        generated_files.append(png_path)
-    
-    png_path = build_overall(analyzer)
-    if png_path:
-        generated_files.append(png_path)
-    
-    png_path = build_weaponskill(analyzer)
-    if png_path:
-        generated_files.append(png_path)
-    
-    png_path = build_key_moments(analyzer)
-    if png_path:
-        generated_files.append(png_path)
-    
+    for key, files in valid_groups:
+        names = {f.name: f for f in files}
+        # find files by pattern
+        battle_file = next((f for f in files if 'Battle Log' in f.name), None)
+        basic_file = next((f for f in files if 'Basic' in f.name), None)
+        catalog_file = next((f for f in files if 'Catalog' in f.name), None)
+        background_file = (INPUT_DIR / 'background.png') if (INPUT_DIR / 'background.png').exists() else None
+
+        print(f"\nFound group: {key}")
+        print(f"  Battle Log: {battle_file.name if battle_file else 'MISSING'}")
+        print(f"  Basic: {basic_file.name if basic_file else 'MISSING'}")
+        if catalog_file:
+            print(f"  Catalog: {catalog_file.name}")
+
+        if not battle_file or not basic_file:
+            print("  → Skipping group (missing required files)")
+            continue
+
+        analyzer = FFXIBattleAnalyzer(battle_file, basic_file, catalog_file, background_file)
+        print(f"  Boss detected: {analyzer.boss}")
+        print(f"  Players: {', '.join(analyzer.players)}")
+
+        safe_suffix = '_' + key.replace(' ', '_')
+
+        # Generate all images for this group
+        group_generated = []
+        for builder in (build_dps, build_healing, build_damage_taken, build_overall, build_weaponskill, build_key_moments):
+            try:
+                png_path = builder(analyzer, suffix=safe_suffix)
+                if png_path:
+                    group_generated.append(png_path)
+                    generated_files.append(png_path)
+            except TypeError:
+                # builder may not accept suffix (defensive) — try without
+                png_path = builder(analyzer)
+                if png_path:
+                    group_generated.append(png_path)
+                    generated_files.append(png_path)
+
+        # If configured, upload this group's images to Discord with a header message
+        if DISCORD_WEBHOOK_URL and group_generated:
+            header = f"📊 Parsing data for {analyzer.boss} {key}"
+            send_discord_message(header, DISCORD_WEBHOOK_URL)
+            for png_file in group_generated:
+                upload_to_discord(png_file, DISCORD_WEBHOOK_URL)
+
     print(f'\nAll PNGs generated in {OUTPUT_DIR}')
-    
-    # Upload each image to Discord
-    if DISCORD_WEBHOOK_URL and generated_files:
-        print(f'\nUploading {len(generated_files)} images to Discord...')
-        for png_file in generated_files:
-            upload_to_discord(png_file, DISCORD_WEBHOOK_URL)
-        print('Upload complete!')
+    # Note: uploads are performed per-group above (a header message is sent, then that group's images).
+    # The global upload loop was removed to avoid duplicate uploads.
 
 
 if __name__ == '__main__':
