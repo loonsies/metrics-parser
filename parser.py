@@ -205,19 +205,20 @@ class FFXIBattleAnalyzer:
         return "Unknown Boss"
     
     def calculate_dps_stats(self):
-        """Calculate DPS statistics for all players"""
-        damage_flags = ['Melee', 'WS', 'SC', 'Nuking', 'Spells']
+        """Calculate DPS statistics for all players (new format)"""
+        # Use new event types for damage
+        damage_flags = ['Melee', 'Weaponskill', 'Skillchain', 'Offensive Magic']
         damage_df = self.battle_log[self.battle_log['Flag'].isin(damage_flags)]
-        
+
         dps_stats = {}
         for player in self.players:
             player_damage = damage_df[damage_df['Player Name'] == player]
-            
+
             # Convert damage to numeric, handling '---' and other non-numeric values
             damage_values = pd.to_numeric(player_damage['Damage'], errors='coerce').fillna(0)
-            
+
             total_damage = damage_values.sum()
-            
+
             # Calculate fight duration
             if not player_damage.empty:
                 start_time = player_damage['Time'].min()
@@ -230,143 +231,115 @@ class FFXIBattleAnalyzer:
             else:
                 dps = 0
                 duration_seconds = 0
-            
+
             # Get breakdown by damage type
             breakdown = {}
             for flag in damage_flags:
                 flag_damage = player_damage[player_damage['Flag'] == flag]
                 flag_values = pd.to_numeric(flag_damage['Damage'], errors='coerce').fillna(0)
                 breakdown[flag] = flag_values.sum()
-            
+
             dps_stats[player] = {
                 'total_damage': total_damage,
                 'dps': dps,
                 'duration': duration_seconds,
                 'breakdown': breakdown
             }
-        
+
         return dps_stats
     
     def calculate_healing_stats(self):
-        """Calculate healing statistics for all players"""
-        healing_df = self.battle_log[self.battle_log['Flag'] == 'Healing']
-        
-        healing_stats = {}
-        for player in self.players:
-            player_healing = healing_df[healing_df['Player Name'] == player]
-            
-            # Convert healing to numeric
-            healing_values = pd.to_numeric(player_healing['Damage'], errors='coerce').fillna(0)
-            
-            total_healing = healing_values.sum()
-            heal_count = len(player_healing)
-            avg_heal = total_healing / heal_count if heal_count > 0 else 0
-            
-            healing_stats[player] = {
-                'total_healing': total_healing,
-                'heal_count': heal_count,
-                'avg_heal': avg_heal
-            }
-        
+        """Calculate healing given by each player from Database CSV (Player = healer)"""
+        healing_stats = {p: {'total_healing': 0, 'heal_count': 0, 'avg_heal': 0} for p in self.players}
+        try:
+            if self.basic is not None:
+                df = self.basic
+                for p in self.players:
+                    rows = df[(df['Player'] == p) & (df['Trackable'].isin(['Spells Healing', 'All Sources Healing'])) & (df['Metric'] == 'Total')]
+                    total = rows['Value'].astype(float).sum()
+                    count = len(rows)
+                    avg = total / count if count > 0 else 0
+                    healing_stats[p]['total_healing'] = total
+                    healing_stats[p]['heal_count'] = count
+                    healing_stats[p]['avg_heal'] = avg
+        except Exception:
+            pass
         return healing_stats
     
     def calculate_healing_received_stats(self):
-        """Calculate healing received by each player (who got healed)"""
+        """Calculate healing received by each player from Database CSV (Target = recipient).
+
+        The Database CSV contains both per-player targets and aggregate targets like '!All Mobs'.
+        We include aggregate targets in the results so totals reconcile with heal-given.
+        """
+        # Only include actual players as recipients. Aggregate targets like '!All Mobs'
+        # represent group-wide stats (not an individual) and should not appear in
+        # the per-player "Heal Received" breakdown.
         healing_received = {p: {'total_received': 0, 'heal_count': 0} for p in self.players}
-
-        # Prefer using the 'Basic' CSV which contains Healing Received totals per Actor/Target
-        # Format: Recipient,Healer,,Healing Received,Total,Value where Actor=recipient, Target=healer
         try:
-            if self.basic is not None and 'Trackable' in self.basic.columns:
+            if self.basic is not None:
                 df = self.basic
-                hr = df[(df['Trackable'] == 'Healing Received') & (df['Metric'] == 'Total')]
-                if not hr.empty:
-                    for _, row in hr.iterrows():
-                        actor = row.get('Actor', '')
-                        val = 0
-                        try:
-                            val = float(row.get('Value', 0))
-                        except Exception:
-                            val = 0
-                        # Actor is the recipient in Basic CSV for Healing Received
-                        if actor in healing_received:
-                            healing_received[actor]['total_received'] += val
-                
-                # Also count heal instances for each recipient
-                hr_attempts = df[(df['Trackable'] == 'Healing Received') & (df['Metric'] == 'Attempts')]
-                if not hr_attempts.empty:
-                    for _, row in hr_attempts.iterrows():
-                        actor = row.get('Actor', '')
-                        cnt = 0
-                        try:
-                            cnt = int(row.get('Value', 0))
-                        except Exception:
-                            cnt = 0
-                        if actor in healing_received:
-                            healing_received[actor]['heal_count'] += cnt
+                # Normalize target values and filter to only real players we know about
+                targets_mask = df['Target'].isin(self.players)
+                rows = df[targets_mask & df['Trackable'].isin(['Spells Healing', 'All Sources Healing']) & (df['Metric'] == 'Total')]
+                for p in self.players:
+                    pr = rows[rows['Target'] == p]
+                    total = pr['Value'].astype(float).sum() if not pr.empty else 0
+                    count = len(pr)
+                    healing_received[p]['total_received'] = total
+                    healing_received[p]['heal_count'] = count
         except Exception:
             pass
-
-        # Fallback: try to infer from battle_log Note field if basic didn't provide totals
-        try:
-            healing_df = self.battle_log[self.battle_log['Flag'] == 'Healing']
-            if 'Note' in healing_df.columns:
-                for player in self.players:
-                    if healing_received[player]['total_received'] == 0:
-                        received_heals = healing_df[healing_df['Note'].str.contains(player, na=False, case=False)]
-                        healing_values = pd.to_numeric(received_heals['Damage'], errors='coerce').fillna(0)
-                        healing_received[player]['total_received'] = healing_values.sum()
-                        healing_received[player]['heal_count'] = len(received_heals)
-        except Exception:
-            pass
-
         return healing_received
     
     def calculate_damage_taken(self):
-        """Calculate damage taken by each player"""
+        """Calculate damage taken by each player (custom for your Database CSV)"""
         damage_taken_stats = {}
-        
+
         for player in self.players:
-            # Get damage from basic stats
-            player_basic = self.basic[
-                (self.basic['Actor'] == player) & 
-                (self.basic['Metric'] == 'Total') &
-                (self.basic['Trackable'] == 'Total Damage Taken')
-            ]
-            
+            # Sum 'Total' from 'Defense Damage Taken Total' for each player
+            if 'Player' in self.basic.columns:
+                player_basic = self.basic[
+                    (self.basic['Player'] == player) &
+                    (self.basic['Trackable'] == 'Defense Damage Taken Total') &
+                    (self.basic['Metric'] == 'Total')
+                ]
+            else:
+                player_basic = pd.DataFrame()
+
             if not player_basic.empty:
-                total_damage_taken = player_basic['Value'].sum()
+                total_damage_taken = player_basic['Value'].astype(float).sum()
             else:
                 total_damage_taken = 0
-            
+
             # Check for deaths
             deaths = self.battle_log[
-                (self.battle_log['Player Name'] == player) & 
+                (self.battle_log['Player Name'] == player) &
                 (self.battle_log['Flag'] == 'Death')
             ]
             death_count = len(deaths)
-            
+
             damage_taken_stats[player] = {
                 'total_damage_taken': total_damage_taken,
                 'deaths': death_count
             }
-        
+
         return damage_taken_stats
     
     def calculate_weaponskill_stats(self):
-        """Calculate detailed weaponskill statistics for all players"""
-        ws_df = self.battle_log[self.battle_log['Flag'] == 'WS']
-        
+        """Calculate detailed weaponskill statistics for all players (new format)"""
+        ws_df = self.battle_log[self.battle_log['Flag'] == 'Weaponskill']
+
         ws_stats = defaultdict(lambda: defaultdict(list))
-        
+
         for _, row in ws_df.iterrows():
             player = row['Player Name']
             ws_name = row['Action']
             damage = pd.to_numeric(row['Damage'], errors='coerce')
-            
+
             if pd.notna(damage) and damage > 0:
                 ws_stats[player][ws_name].append(damage)
-        
+
         # Calculate min, max, avg for each WS
         ws_summary = []
         for player in sorted(ws_stats.keys()):
@@ -381,7 +354,7 @@ class FFXIBattleAnalyzer:
                     'Avg': sum(damages) / len(damages),
                     'Total': sum(damages)
                 })
-        
+
         return ws_summary
     
     def get_key_moments(self):
@@ -1245,13 +1218,13 @@ def main():
             key = datetime.fromtimestamp(p.stat().st_mtime).strftime('%m-%d-%Y %H-%M-%S')
         groups[key].append(p)
 
-    # Build list of groups that contain at least a Battle Log and Basic CSV
+    # Build list of groups that contain at least a Battle Log and Database CSV (new format)
     valid_groups = []
     for key, files in groups.items():
         names = [f.name for f in files]
         has_battle = any('Battle Log' in n for n in names)
-        has_basic = any('Basic' in n for n in names)
-        if has_battle and has_basic:
+        has_database = any('Database' in n for n in names)
+        if has_battle and has_database:
             valid_groups.append((key, files))
 
     if not valid_groups:
@@ -1279,21 +1252,21 @@ def main():
         names = {f.name: f for f in files}
         # find files by pattern
         battle_file = next((f for f in files if 'Battle Log' in f.name), None)
-        basic_file = next((f for f in files if 'Basic' in f.name), None)
+        database_file = next((f for f in files if 'Database' in f.name), None)
         catalog_file = next((f for f in files if 'Catalog' in f.name), None)
         background_file = (INPUT_DIR / 'background.png') if (INPUT_DIR / 'background.png').exists() else None
 
         print(f"\nFound group: {key}")
         print(f"  Battle Log: {battle_file.name if battle_file else 'MISSING'}")
-        print(f"  Basic: {basic_file.name if basic_file else 'MISSING'}")
+        print(f"  Database: {database_file.name if database_file else 'MISSING'}")
         if catalog_file:
             print(f"  Catalog: {catalog_file.name}")
 
-        if not battle_file or not basic_file:
+        if not battle_file or not database_file:
             print("  → Skipping group (missing required files)")
             continue
 
-        analyzer = FFXIBattleAnalyzer(battle_file, basic_file, catalog_file, background_file)
+        analyzer = FFXIBattleAnalyzer(battle_file, database_file, catalog_file, background_file)
         print(f"  Boss detected: {analyzer.boss}")
         print(f"  Players: {', '.join(analyzer.players)}")
 
