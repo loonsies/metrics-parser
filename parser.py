@@ -192,16 +192,80 @@ class FFXIBattleAnalyzer:
         return player_colors
     
     def _detect_boss(self):
-        """Detect the boss name from the battle log"""
-        mob_death = self.battle_log[self.battle_log['Flag'] == 'Mob Death']
-        if not mob_death.empty:
-            return mob_death.iloc[0]['Player Name']
-        
-        # Try to find from mob actions
-        mob_actions = self.battle_log[self.battle_log['Flag'].str.contains('Mob', na=False)]
-        if not mob_actions.empty:
-            return mob_actions.iloc[0]['Player Name']
-        
+        """Detect the boss name from the battle log or database CSV (new format). If ambiguous, prompt user to select boss."""
+        # Compute a candidate from the battle log: use the most frequent 'Player Name'
+        # for mob-related flags. This avoids picking the first Mob Death (which may be
+        # a minor add) and instead picks the main mob seen throughout the fight.
+        battle_candidate = None
+        try:
+            mob_mask = self.battle_log['Flag'].str.contains('Mob', na=False)
+            mob_rows = self.battle_log[mob_mask]
+            if not mob_rows.empty:
+                # choose the most frequent 'Player Name' among mob rows
+                battle_candidate = mob_rows['Player Name'].value_counts().idxmax()
+        except Exception:
+            battle_candidate = None
+        # New format: infer boss from Database CSV by most frequent non-player Target
+        db_candidate = None
+        if self.basic is not None and 'Target' in self.basic.columns:
+            targets = self.basic['Target'].dropna()
+            player_set = set(self.battle_log['Player Name'].unique())
+            filtered = targets[~targets.isin(player_set) & (targets != '') & (targets != '!All Mobs') & (targets != 'System')]
+            if not filtered.empty:
+                counts = filtered.value_counts()
+                db_candidate = counts.idxmax()
+
+        # If DB suggests a candidate, and it differs from the battle-log candidate,
+        # prompt the user to choose (interactive). In non-interactive mode, default
+        # to the DB candidate to be conservative.
+        if db_candidate:
+            # If we already returned above from mob_death/mob_actions we would have exited.
+            # Since we reached here, no battle-log mob was decisive; use DB candidate.
+            # But if a mis-detection still occurred earlier (e.g., caller saw wrong value), allow explicit prompt.
+            # If running interactively, ask the user to confirm the DB candidate.
+            # If a battle-log candidate exists and differs, prompt to disambiguate
+            if battle_candidate and battle_candidate != db_candidate:
+                print('Detected different boss candidates:')
+                print(f"  [1] From battle log   → {battle_candidate}")
+                print(f"  [2] From Database CSV → {db_candidate}")
+                # Also include top DB candidates if present
+                try:
+                    db_top = list(self.basic['Target'].value_counts().index[:5])
+                except Exception:
+                    db_top = [db_candidate]
+                i = 3
+                for t in db_top:
+                    if t not in (battle_candidate, db_candidate):
+                        print(f"  [{i}] {t}")
+                        i += 1
+                # prompt for selection interactively (fallback to db_candidate)
+                try:
+                    if hasattr(__builtins__, 'input'):
+                        sel = input("Select boss candidate by number or press Enter to accept DB candidate: ").strip()
+                        if sel:
+                            try:
+                                sel = int(sel)
+                                if sel == 1:
+                                    return battle_candidate
+                                elif sel == 2:
+                                    return db_candidate
+                                else:
+                                    idx = sel - 3
+                                    if 0 <= idx < len(db_top):
+                                        return db_top[idx]
+                            except Exception:
+                                pass
+                        return db_candidate
+                except Exception:
+                    return db_candidate
+            else:
+                # no conflict; prefer DB candidate
+                return db_candidate
+
+        # Fallback: prefer the battle log candidate if present
+        if battle_candidate:
+            return battle_candidate
+
         return "Unknown Boss"
     
     def calculate_dps_stats(self):
